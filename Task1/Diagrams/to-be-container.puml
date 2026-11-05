@@ -1,0 +1,105 @@
+@startuml to-be-container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+' Целевая архитектура через год: микросервисы, событийная обработка,
+' горизонтальное масштабирование, несколько регионов.
+
+AddElementTag("hot", $bgColor="#b03a2e", $borderColor="#78281f", $legendText="hot path: SLO P95 ≤ 80 мс")
+AddElementTag("nrt", $bgColor="#2471a3", $borderColor="#1a5276", $legendText="near-real-time: секунды")
+AddElementTag("back", $bgColor="#5d6d7e", $borderColor="#34495e", $legendText="back-office: интерактивные и фоновые")
+AddElementTag("infra", $bgColor="#7d3c98", $borderColor="#512e5f", $legendText="инфраструктура")
+AddRelTag("async", $lineStyle=DashedLine(), $legendText="асинхронно (события Kafka)")
+
+LAYOUT_TOP_DOWN()
+
+title C4 Container — AdScale (TO-BE, через год)
+
+Person(advertiser, "Рекламодатель", "Кампании, бюджеты, отчёты")
+Person_Ext(endUser, "Пользователь сайта / приложения", "Видит рекламу, кликает")
+System_Ext(dsp, "DSP / SSP-партнёры", "Несколько платформ, OpenRTB 2.x")
+System_Ext(paymentGateway, "Платёжный шлюз", "Пополнение бюджетов")
+System_Ext(cdn, "CDN", "Креативы: изображения, видео, скрипты")
+
+System_Boundary(adscale, "AdScale Platform (Kubernetes, несколько регионов)") {
+
+    Container(globalLb, "Global Load Balancer", "GeoDNS + L7 LB", "Направляет трафик в ближайший здоровый регион", $tags="infra")
+
+    Boundary(hot, "Hot path — разворачивается в каждом регионе (active-active)") {
+        Container(bidGateway, "Bid Gateway", "Go", "Адаптеры OpenRTB под каждого партнёра, валидация, таймауты, rate limiting, load shedding", $tags="hot")
+        Container(bidding, "Bidding Service", "C++", "Таргетинг, подбор кандидатов, аукцион, проверка бюджета; in-memory индекс кампаний", $tags="hot")
+        Container(delivery, "Delivery Service", "Node.js", "Разметка баннера для bid-response", $tags="hot")
+        Container(eventCollector, "Event Collector", "Go", "Трекинг показов и кликов (пиксели, redirect)", $tags="hot")
+        ContainerDb(redis, "Redis Cluster", "Redis", "Профили и сегменты пользователей, счётчики расхода бюджета", $tags="infra")
+    }
+
+    ContainerQueue(kafka, "Kafka", "Apache Kafka (региональные кластеры + MirrorMaker 2)", "bids, impressions, clicks, spend, campaign-changes, budget-status", $tags="infra")
+
+    Boundary(nrt, "Near-real-time обработка") {
+        Container(streamProc, "Stats Stream Processor", "Kafka Streams / Flink", "Дедупликация, обогащение, агрегаты по кампаниям", $tags="nrt")
+        Container(budget, "Budget & Pacing Service", "Go", "Учёт расхода в реальном времени, равномерный расход, остановка кампаний при исчерпании бюджета", $tags="nrt")
+    }
+
+    Boundary(back, "Back-office — основной регион + резервный") {
+        Container(apiGateway, "API Gateway", "Kong / Envoy", "Единая точка входа для кабинета и публичного API: аутентификация, маршрутизация, лимиты", $tags="infra")
+        Container(dashboard, "Advertiser Dashboard", "React SPA", "UI рекламодателя", $tags="back")
+        Container(campaign, "Campaign Service", "Go", "Кампании, ставки, таргетинг, креативы; публикует изменения через outbox", $tags="back")
+        Container(billing, "Billing Service", "Go", "Финансовый журнал (ledger), счета, балансы, сверка, пополнения", $tags="back")
+        Container(reporting, "Reporting Service", "Python", "Отчёты и аналитика для рекламодателей", $tags="back")
+        ContainerDb(campaignDb, "Campaign DB", "PostgreSQL (HA)", "Кампании, ставки, креативы", $tags="infra")
+        ContainerDb(billingDb, "Billing DB", "PostgreSQL (HA)", "Ledger, счета, балансы", $tags="infra")
+        ContainerDb(clickhouse, "Analytics Store", "ClickHouse", "События и агрегаты для отчётов", $tags="infra")
+    }
+
+    Container(observability, "Observability", "Prometheus, Grafana, OpenTelemetry, Loki", "Метрики, трассировка, логи, SLO и алерты", $tags="infra")
+}
+
+' --- Входящий трафик
+Rel(dsp, globalLb, "bid-request / bid-response", "HTTPS / OpenRTB")
+Rel(endUser, globalLb, "Показы и клики", "HTTPS")
+Rel(endUser, cdn, "Загрузка креативов", "HTTPS")
+Rel(advertiser, dashboard, "Работа в кабинете", "HTTPS")
+Rel(globalLb, bidGateway, "bid-request", "HTTP/2")
+Rel(globalLb, eventCollector, "Трекинг", "HTTPS")
+Rel(dashboard, apiGateway, "API кабинета", "HTTPS / REST")
+
+' --- Hot path
+Rel(bidGateway, bidding, "Нормализованный запрос", "gRPC")
+Rel(bidding, redis, "Профиль пользователя, остаток бюджета", "RESP, < 1 мс")
+Rel(bidding, delivery, "Победитель → разметка", "gRPC")
+BiRel(bidding, kafka, "Пишет результаты аукционов; читает campaign-changes и budget-status → in-memory индекс", "Kafka", $tags="async")
+Rel(eventCollector, kafka, "Показы и клики", "Kafka", $tags="async")
+
+' --- Near-real-time
+BiRel(streamProc, kafka, "Читает bids, impressions, clicks; пишет spend", "Kafka", $tags="async")
+Rel(streamProc, clickhouse, "События и агрегаты", "batch insert")
+BiRel(budget, kafka, "Читает spend; пишет budget-status", "Kafka", $tags="async")
+Rel(budget, redis, "Счётчики и статус бюджета", "RESP")
+
+' --- Back-office
+Rel(apiGateway, campaign, "Кампании", "REST")
+Rel(apiGateway, billing, "Финансы", "REST")
+Rel(apiGateway, reporting, "Отчёты", "REST")
+Rel(campaign, campaignDb, "CRUD", "SQL")
+BiRel(campaign, kafka, "Пишет campaign-changes (outbox); читает budget-status", "Kafka", $tags="async")
+Rel(campaign, cdn, "Загрузка креативов", "HTTPS")
+Rel(kafka, billing, "spend → списания", "Kafka", $tags="async")
+Rel(billing, billingDb, "Транзакции", "SQL")
+Rel(billing, paymentGateway, "Платежи", "HTTPS / REST")
+Rel(paymentGateway, billing, "Подтверждение оплаты", "HTTPS callback")
+Rel(reporting, clickhouse, "Аналитические запросы", "SQL")
+
+note right of bidding
+  **Бюджет времени (P95 ≤ 80 мс)**
+  Gateway 5 · Bidding 25–35
+  Delivery 5–10 · сеть 10–15
+  Ни одного обращения к SQL-БД
+end note
+
+note bottom of kafka
+  Все сервисы hot path — stateless,
+  масштабируются по RPS и CPU (HPA).
+  Цель: 50 000 RPS, доступность 99.9%
+end note
+
+SHOW_LEGEND()
+@enduml

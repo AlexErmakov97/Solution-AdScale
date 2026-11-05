@@ -1,0 +1,81 @@
+@startuml stage1-container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+' Этап 1 — промежуточное решение через 3 месяца (Strangler Fig, шаг 1)
+
+AddElementTag("new", $bgColor="#1e8449", $borderColor="#145a32", $legendText="новый компонент")
+AddElementTag("changed", $bgColor="#2471a3", $borderColor="#1a5276", $legendText="изменённый компонент")
+AddElementTag("legacy", $bgColor="#7f8c8d", $borderColor="#566573", $legendText="остаётся в монолите")
+AddRelTag("async", $lineStyle=DashedLine(), $legendText="асинхронно (через Kafka)")
+
+LAYOUT_TOP_DOWN()
+
+title C4 Container — AdScale, этап 1 (через 3 месяца)
+
+Person(advertiser, "Рекламодатель", "Управляет кампаниями и бюджетами")
+Person_Ext(endUser, "Пользователь сайта / приложения", "Видит рекламу, кликает")
+System_Ext(dspPartner, "DSP-партнёры", "Текущий и новый партнёр, OpenRTB")
+System_Ext(paymentGateway, "Платёжный шлюз", "Пополнение бюджетов")
+
+System_Boundary(adscale, "AdScale") {
+    Container(edge, "Edge Proxy", "Envoy", "Strangler-фасад: маршрутизирует RTB- и трекинг-трафик в новые сервисы, остальное — в монолит; таймауты, rate limiting по партнёрам", $tags="new")
+
+    Boundary(k8s, "Managed Kubernetes, автомасштабирование") {
+        Container(bidding, "Bidding Service", "C++", "Ad Server + Auction Engine, вынесенные из монолита; stateless; читает только кеш; отвечает no-bid, если не укладывается в бюджет времени", $tags="new")
+        Container(delivery, "Delivery Service", "Node.js", "Код из монолита в контейнере: разметка баннера, трекинг показов и кликов; события — в Kafka", $tags="changed")
+        Container(cacheSync, "Cache Sync", "Go", "Каждые 1–5 с переносит изменения кампаний, ставок и бюджетов из реплики БД в Redis", $tags="new")
+    }
+
+    ContainerDb(redis, "Redis", "Redis Cluster", "Кампании, ставки, данные таргетинга, остаток бюджетов", $tags="new")
+    ContainerQueue(kafka, "Kafka", "управляемый Kafka", "Топики impressions, clicks, bids", $tags="new")
+
+    System_Boundary(monolith, "AdScale Monolith (остаток)") {
+        Container(statsService, "Statistics Service", "Python", "Kafka-консьюмер: дедупликация, пакетная запись, агрегаты расхода по кампаниям", $tags="changed")
+        Container(financialService, "Financial Service", "Go", "Списания по агрегатам, счета, балансы", $tags="legacy")
+        Container(analyticsService, "Analytics Service", "Python", "Отчёты — только с реплики", $tags="changed")
+        Container(adCabinet, "Advertiser Dashboard", "Node.js + JavaScript", "UI рекламодателя", $tags="legacy")
+    }
+
+    ContainerDb(pgPrimary, "PostgreSQL primary", "PostgreSQL + Patroni", "Кампании, финансы, события (партиции по дням)", $tags="changed")
+    ContainerDb(pgStandby, "PostgreSQL standby", "синхронная реплика", "Автоматическое переключение при отказе primary", $tags="new")
+    ContainerDb(pgReplica, "PostgreSQL read replica", "асинхронная реплика", "Аналитика, отчёты, источник для Cache Sync", $tags="new")
+
+    Container(monitoring, "Мониторинг", "Prometheus, Grafana, OpenTelemetry", "P50/P95/P99 по сервисам и партнёрам, алерты по SLO", $tags="new")
+}
+
+Rel(dspPartner, edge, "bid-request / bid-response", "HTTPS / OpenRTB")
+Rel(endUser, edge, "Показы и клики", "HTTPS")
+Rel(advertiser, edge, "Работа в кабинете", "HTTPS")
+
+Rel(edge, bidding, "bid-request", "HTTP/2")
+Rel(edge, delivery, "Трекинг показов и кликов", "HTTP")
+Rel(edge, adCabinet, "Остальной трафик", "HTTP")
+
+Rel(bidding, redis, "Кампании, ставки, таргетинг, остаток бюджета", "RESP, < 1 мс")
+Rel(bidding, delivery, "Победитель → разметка", "gRPC")
+Rel(bidding, kafka, "Результаты аукционов", "Kafka", $tags="async")
+Rel(delivery, kafka, "Показы и клики", "Kafka", $tags="async")
+
+Rel(kafka, statsService, "События", "Kafka consumer", $tags="async")
+Rel(statsService, pgPrimary, "Пакетная запись событий и агрегатов", "COPY / batch")
+Rel(statsService, financialService, "Расход по кампаниям", "Internal Call")
+Rel(financialService, pgPrimary, "Транзакции и балансы", "JDBC")
+Rel(adCabinet, pgPrimary, "CRUD", "JDBC")
+Rel(adCabinet, financialService, "Финансы", "Internal Call")
+Rel(adCabinet, analyticsService, "Отчёты", "Internal Call")
+Rel(adCabinet, paymentGateway, "Пополнение бюджета", "HTTPS / REST")
+Rel(paymentGateway, financialService, "Подтверждение оплаты", "HTTPS callback")
+Rel(analyticsService, pgReplica, "Аналитические запросы", "JDBC")
+
+Rel(pgPrimary, pgStandby, "Синхронная репликация", "streaming")
+Rel(pgPrimary, pgReplica, "Асинхронная репликация", "streaming")
+Rel(cacheSync, pgReplica, "Изменения кампаний и бюджетов", "JDBC")
+Rel(cacheSync, redis, "Обновление кеша", "RESP")
+
+note bottom of bidding
+  **Hot path без БД:** Edge → Bidding → Redis → Delivery
+  Цель: ≥ 18 000 RPS, P95 ≤ 80 мс
+end note
+
+SHOW_LEGEND()
+@enduml
