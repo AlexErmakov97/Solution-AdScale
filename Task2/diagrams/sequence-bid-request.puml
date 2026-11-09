@@ -1,0 +1,44 @@
+@startuml sequence-bid-request
+title Обработка bid-request: основной сценарий (бюджет ≤ 80 мс)
+autonumber
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+
+participant "DSP-партнёр" as DSP
+participant "Envoy" as Envoy
+participant "Bid Gateway" as BGW
+participant "Bidding Service" as BS
+database "Redis" as Redis
+participant "Delivery Service" as DEL
+queue "Kafka" as K
+
+DSP -> Envoy : POST /openrtb/2.6/{partner}/bid\n(tmax = 80 мс)
+activate Envoy
+note right of Envoy : mTLS + RBAC по SAN и IP\nlocal rate limit\nadaptive concurrency\n≈ 1 мс
+Envoy -> BGW : bid-request (HTTP/2)
+activate BGW
+BGW -> BGW : адаптер партнёра: разбор и валидация OpenRTB
+BGW -> BGW : дедлайн = min(tmax, 80) − 12 мс сеть − 2 мс\n= 66 мс
+BGW -> BS : Bid(BidRequest), gRPC deadline 66 мс
+activate BS
+BS -> Redis : pipeline: user, budget:status,\npacing, freq
+Redis --> BS : данные (≈ 1–3 мс)
+BS -> BS : подбор кандидатов (in-memory индекс)\nфильтрация, цена, аукцион\n≈ 10–15 мс
+BS -> DEL : Render(победитель), deadline 10 мс
+activate DEL
+DEL --> BS : adm (HTML/JS)
+deactivate DEL
+BS --> BGW : BidResponse(bid_id, price_micros,\nadm, nurl, burl)
+BS ->> K : bids {bid_id, campaign_id, price,\noutcome, latency} — после ответа
+deactivate BS
+BGW -> BGW : OpenRTB bid-response,\nподписанные nurl / burl
+BGW --> Envoy : 200 OK + bid-response
+deactivate BGW
+Envoy --> DSP : 200 OK (≈ 35–50 мс внутри AdScale)
+deactivate Envoy
+
+note over DSP, K
+  Если подходящих кампаний нет — Bidding Service возвращает пустой ответ
+  с no_bid_reason, Bid Gateway отвечает партнёру HTTP 204.
+end note
+@enduml
