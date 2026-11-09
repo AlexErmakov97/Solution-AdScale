@@ -1,0 +1,60 @@
+@startuml data-replication
+title Репликация и шардирование хранилищ (основной регион + резервный)
+skinparam defaultTextAlignment center
+skinparam rectangle {
+  RoundCorner 8
+}
+skinparam database {
+  BackgroundColor #EAF2F8
+}
+top to bottom direction
+
+rectangle "PostgreSQL: Campaign DB и Billing DB (Patroni)\nшардирование не нужно; ledger — партиции по месяцам" as PG {
+  database "primary\nзона A\nчтение и запись" as pgP
+  database "standby\nзона B\nсинхронно, RPO = 0" as pgS
+  database "replica\nзона C\nасинхронно: снимки,\nотчёты, сверка" as pgR
+}
+
+rectangle "Резервный регион" as R2 {
+  database "PostgreSQL\nасинхронная реплика\nRPO ≤ 1 мин" as pgDr
+  rectangle "Объектное хранилище\nрезервные копии\n(полные + WAL, PITR)" as S3
+  rectangle "Kafka (резервный)\nприём через MirrorMaker 2" as K2
+}
+
+rectangle "ClickHouse: stats + reporting (ReplicatedMergeTree, Keeper)\nсырые события — по cityHash64(bid_id); агрегаты и витрины — по cityHash64(advertiser_id)" as CH {
+  rectangle "шард 1" as sh1 {
+    database "реплика 1\nзона A" as c11
+    database "реплика 2\nзона B" as c12
+  }
+  rectangle "шард 2" as sh2 {
+    database "реплика 1\nзона B" as c21
+    database "реплика 2\nзона C" as c22
+  }
+  rectangle "шард 3" as sh3 {
+    database "реплика 1\nзона C" as c31
+    database "реплика 2\nзона A" as c32
+  }
+}
+
+rectangle "redis-rtb: Redis Cluster, 16 384 слота\nhash tag {uid}: профиль и частоты на одном шарде" as RC {
+  database "шард 1\nprimary A\nreplica B" as r1
+  database "шард 2\nprimary B\nreplica C" as r2
+  database "шард 3\nprimary C\nreplica A" as r3
+}
+
+rectangle "Kafka (основной)\nRF = 3, min.insync = 2\nброкеры в зонах A, B, C" as K
+
+pgP -right-> pgS : синхронно
+pgP -down-> pgR : асинхронно
+pgP -right-> pgDr : асинхронно,\nмежрегионально
+pgP -right-> S3 : WAL непрерывно,\nкопии ежедневно
+c11 <-right-> c12
+c21 <-right-> c22
+c31 <-right-> c32
+CH -up-> S3 : агрегаты\nежедневно
+K -up-> K2 : зеркалирование\nтопиков
+
+PG -[hidden]down-> CH
+CH -[hidden]down-> RC
+RC -[hidden]right-> K
+@enduml

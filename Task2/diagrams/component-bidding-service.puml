@@ -1,0 +1,52 @@
+@startuml component-bidding-service
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+AddElementTag("fallback", $bgColor="#b9770e", $borderColor="#7e5109", $legendText="компонент с размыкателем и резервной стратегией")
+AddRelTag("async", $lineStyle=DashedLine(), $legendText="асинхронно")
+
+LAYOUT_TOP_DOWN()
+
+title C4 Component — Bidding Service
+
+Container(bidGateway, "Bid Gateway", "Go", "Нормализованный запрос от DSP")
+Container(campaignSvc, "Campaign Service", "Go", "Источник истины о кампаниях")
+Container(delivery, "Delivery Service", "Node.js", "Разметка баннера")
+ContainerDb(redis, "Redis Cluster", "Redis", "Профили, статус бюджета, pacing, частота")
+ContainerQueue(kafka, "Kafka", "Apache Kafka", "campaign-changes, budget-status, bids")
+
+Container_Boundary(bidding, "Bidding Service (C++, stateless)") {
+    Component(api, "gRPC API", "gRPC server", "BiddingService.Bid, health, метрики")
+    Component(deadline, "Deadline Guard", "C++", "Проверяет остаток времени перед каждым шагом; отдаёт лучший готовый результат или no-bid")
+    Component(profile, "Profile & Budget Reader", "C++, Redis pipeline", "Один pipeline: профиль, статус бюджета, pacing, частота; CB, таймаут 5 мс", $tags="fallback")
+    Component(selector, "Candidate Selector", "C++", "Пересечение инвертированных индексов: размер, гео, устройство, сегменты")
+    Component(filter, "Eligibility Filter", "C++", "Статус, бюджет, частота, bidfloor, блок-листы площадки")
+    Component(pricer, "Bid Pricer", "C++", "Цена: стратегия кампании × pacing × качество; ставка по умолчанию при недоступном pacing")
+    Component(auction, "Auction", "C++", "Победитель по eCPM")
+    Component(markup, "Markup Client", "gRPC client", "Разметка победителя; CB, таймаут 10 мс; markup-on-win при сбое", $tags="fallback")
+    Component(publisher, "Event Publisher", "librdkafka, буфер в памяти", "Публикует результаты после ответа, не блокирует запрос")
+    ComponentDb(index, "Campaign Index", "in-memory", "Кампании, таргетинг, креативы, последний статус бюджета; версии")
+    Component(updater, "Index Updater", "Kafka consumer", "Применяет campaign-changes и budget-status по версиям")
+    Component(loader, "Snapshot Loader", "gRPC stream client", "Полный снимок при старте, повторы с экспоненциальной задержкой")
+}
+
+Rel(bidGateway, api, "Bid(BidRequest)", "gRPC, deadline")
+Rel(api, deadline, "Запрос + дедлайн")
+Rel(deadline, profile, "1. Данные пользователя и бюджета")
+Rel(profile, redis, "Pipeline GET/HGETALL", "RESP, ≤ 5 мс")
+Rel(deadline, selector, "2. Кандидаты")
+Rel(selector, index, "Чтение индексов")
+Rel(selector, filter, "Кандидаты")
+Rel(filter, pricer, "Допустимые кандидаты")
+Rel(pricer, auction, "Ставки")
+Rel(auction, markup, "Победитель")
+Rel(markup, delivery, "Разметка", "gRPC, ≤ 10 мс")
+Rel(api, publisher, "Результат аукциона")
+Rel(publisher, kafka, "bids", "Kafka, acks=1", $tags="async")
+
+Rel(loader, campaignSvc, "Снимок кампаний (при старте)", "gRPC stream")
+Rel(loader, index, "Загрузка")
+Rel(kafka, updater, "campaign-changes, budget-status", "Kafka", $tags="async")
+Rel(updater, index, "Обновление по версиям")
+
+SHOW_LEGEND()
+@enduml

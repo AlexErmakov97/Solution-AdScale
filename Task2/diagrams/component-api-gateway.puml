@@ -1,0 +1,54 @@
+@startuml component-api-gateway
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+AddRelTag("async", $lineStyle=DashedLine(), $legendText="асинхронно")
+
+LAYOUT_TOP_DOWN()
+
+title C4 Component — API-слой для DSP (Envoy + Bid Gateway)
+
+System_Ext(dsp, "DSP-партнёр", "OpenRTB 2.6")
+Container(globalLb, "Global Load Balancer", "GeoDNS + L4/L7", "Ближайший здоровый регион")
+Container(bidding, "Bidding Service", "C++", "Решение о ставке")
+Container(eventCollector, "Event Collector", "Go", "win / bill уведомления")
+Container(observability, "Observability", "Prometheus, Grafana, OpenTelemetry", "Метрики, трассы, SLO, алерты")
+Container(config, "Конфигурация", "xDS control plane + SDS", "Маршруты, веса, квоты, сертификаты партнёров")
+
+Container_Boundary(envoy, "Envoy (edge, пул подов в каждом регионе)") {
+    Component(tls, "TLS / mTLS", "listener", "Терминация TLS, проверка клиентского сертификата")
+    Component(rbac, "RBAC", "http filter", "partner_id из SAN сертификата + список IP; сверка с путём")
+    Component(rl, "Local Rate Limit", "http filter", "Token bucket по партнёру в памяти; превышение → 204")
+    Component(ac, "Adaptive Concurrency", "http filter", "Load shedding при росте задержки")
+    Component(router, "Router", "route config", "Маршрут по партнёру и версии; веса canary; shadow-зеркалирование; таймаут")
+    Component(cb, "Overload Protection + Outlier Detection", "cluster config", "Лимиты соединений и очереди, переполнение → 204; исключение сбойных подов")
+}
+
+Container_Boundary(bgw, "Bid Gateway (Go, stateless)") {
+    Component(adapters, "Partner Adapters", "Go", "Разбор и валидация OpenRTB, особенности партнёра → внутренний BidRequest")
+    Component(dl, "Deadline Calculator", "Go", "min(tmax, 80) − запас на сеть − потраченное время")
+    Component(appCb, "Bidding Circuit Breaker", "Go", "Окно 10 с; ≥ 20% ошибок → open 5 с; half-open 5%")
+    Component(fallback, "Fallback Responder", "Go", "204 no-bid; опционально кешированная ставка (TTL 60 с)")
+    Component(resp, "Response Builder", "Go", "Внутренний ответ → OpenRTB bid-response, подписанные nurl/burl")
+    Component(metrics, "Telemetry", "OpenTelemetry SDK", "Гистограммы задержки по партнёру, причины no-bid, опоздания")
+}
+
+Rel(dsp, globalLb, "bid-request", "HTTPS / OpenRTB")
+Rel(globalLb, tls, "bid-request", "HTTPS")
+Rel_R(tls, rbac, "")
+Rel_R(rbac, rl, "")
+Rel_R(rl, ac, "")
+Rel_D(ac, router, "")
+Rel_L(router, cb, "")
+Rel(cb, adapters, "bid-request", "HTTP/2")
+Rel(router, eventCollector, "/rtb/win, /rtb/bill", "HTTP")
+Rel_R(adapters, dl, "BidRequest")
+Rel_R(dl, appCb, "BidRequest + дедлайн")
+Rel(appCb, bidding, "Bid()", "gRPC, deadline")
+Rel_D(appCb, fallback, "open / дедлайн истёк")
+Rel(appCb, resp, "BidResponse")
+Rel_L(fallback, resp, "no-bid / кешированная ставка")
+Rel(metrics, observability, "Метрики, трассы", "OTLP", $tags="async")
+Rel(config, router, "Маршруты, веса, квоты", "xDS", $tags="async")
+
+SHOW_LEGEND()
+@enduml

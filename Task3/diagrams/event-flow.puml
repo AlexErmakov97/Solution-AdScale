@@ -1,0 +1,71 @@
+@startuml event-flow
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+AddElementTag("raw", $bgColor="#5d6d7e", $borderColor="#34495e", $legendText="сырые события (delete, 3–7 дней)")
+AddElementTag("money", $bgColor="#b03a2e", $borderColor="#78281f", $legendText="денежные (acks=all)")
+AddElementTag("state", $bgColor="#1e8449", $borderColor="#145a32", $legendText="состояние (compact)")
+AddElementTag("sink", $bgColor="#b9770e", $borderColor="#7e5109", $legendText="хранилище")
+
+LAYOUT_LEFT_RIGHT()
+
+title Потоки событий Kafka: продюсеры → топики → группы потребителей
+
+Boundary(prod, "Продюсеры") {
+  Container(bidding, "Сервис ставок", "C++", "acks=1 для bids")
+  Container(collector, "Event Collector", "Go", "acks=all, идемпотентный продюсер")
+  Container(campaign, "Сервис кампаний", "Go + outbox relay", "")
+}
+
+Boundary(topics, "Kafka (RF=3, min.insync=2, zstd, ключ = campaign_id)") {
+  ContainerQueue(tBids, "bids", "48 партиций, 3 дня", "", $tags="raw")
+  ContainerQueue(tWins, "wins", "24 партиции, 7 дней", "", $tags="money")
+  ContainerQueue(tImp, "impressions", "48 партиций, 7 дней", "", $tags="money")
+  ContainerQueue(tClk, "clicks", "12 партиций, 7 дней", "", $tags="money")
+  ContainerQueue(tSpend, "spend", "12 партиций, 30 дней", "", $tags="money")
+  ContainerQueue(tBudget, "budget-status", "6 партиций, compact", "", $tags="state")
+  ContainerQueue(tCamp, "campaign-changes", "6 партиций, compact", "", $tags="state")
+}
+
+Boundary(cons, "Группы потребителей") {
+  Container(stats, "stats-processor", "Kafka Streams, exactly_once_v2", "Дедупликация, агрегаты за 10 с")
+  Container(loader, "reporting-loader", "Сервис аналитики", "At-least-once + дедупликация")
+  Container(budget, "budget-pacing", "Budget & Pacing", "Идемпотентно по spend_id")
+  Container(billing, "billing", "Сервис финансов", "Уникальный source_id в ledger")
+  Container(campStatus, "campaign-budget-status", "Сервис кампаний", "Статус для кабинета")
+  Container(bidPods, "без группы (assign)", "каждый под Сервиса ставок", "Все партиции, позиция из снимка")
+}
+
+ContainerDb(chStats, "ClickHouse stats", "ClickHouse", "", $tags="sink")
+ContainerDb(chRep, "ClickHouse reporting", "ClickHouse", "", $tags="sink")
+ContainerDb(ledger, "Billing DB", "PostgreSQL", "", $tags="sink")
+
+Rel(bidding, tBids, "BidEvent")
+Rel(collector, tWins, "WinEvent")
+Rel(collector, tImp, "ImpressionEvent")
+Rel(collector, tClk, "ClickEvent")
+Rel(campaign, tCamp, "CampaignChangedEvent")
+
+Rel(tBids, stats, "")
+Rel(tWins, stats, "")
+Rel(tImp, stats, "")
+Rel(tClk, stats, "")
+Rel(stats, tSpend, "SpendEvent")
+Rel(stats, chStats, "события, агрегаты")
+
+Rel(tWins, loader, "")
+Rel(tImp, loader, "")
+Rel(tClk, loader, "")
+Rel(tSpend, loader, "")
+Rel(loader, chRep, "витрины")
+
+Rel(tSpend, budget, "")
+Rel(budget, tBudget, "BudgetStatusEvent")
+Rel(tSpend, billing, "")
+Rel(billing, ledger, "списания")
+
+Rel(tBudget, campStatus, "")
+Rel(tBudget, bidPods, "")
+Rel(tCamp, bidPods, "")
+
+SHOW_LEGEND()
+@enduml

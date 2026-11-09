@@ -1,0 +1,43 @@
+@startuml sequence-campaign-update
+title Доставка данных кампаний в Bidding Service: снимок при старте и события
+skinparam responseMessageBelowArrow true
+
+actor "Рекламодатель" as ADV
+participant "API Gateway\n(кабинет)" as AGW
+participant "Campaign Service" as CS
+database "Campaign DB" as CDB
+participant "Outbox Relay" as OR
+queue "Kafka\ncampaign-changes" as K
+participant "Bidding Service\n(под)" as BS
+
+== Старт пода ==
+BS -> CS : StreamActiveCampaigns()\n(gRPC server streaming)
+loop пока идёт снимок
+  CS --> BS : Campaign, Targeting, Creatives (version)
+end
+BS -> K : подписка с позиции снимка
+K --> BS : изменения, накопившиеся за время загрузки
+BS -> BS : отставание ≤ 30 с → readiness = true,\nпод получает трафик
+note right of BS : Ошибка загрузки — повторы\n100 мс × 2ⁿ, до 10 с, jitter.\nБез снимка под трафик не получает.
+
+== Изменение ставки рекламодателем ==
+ADV -> AGW : PATCH /campaigns/{id}\n{max_bid: 2.40}
+AGW -> CS : REST (JWT)
+CS -> CDB : BEGIN\nUPDATE campaigns SET max_bid, version = version + 1\nINSERT outbox(event)\nCOMMIT
+CS --> AGW : 200 OK (status: applying)
+AGW --> ADV : 200 OK
+
+OR -> CDB : чтение новых записей outbox
+OR -> K : campaign-changes\n{campaign_id, version, поля}\nключ = campaign_id, acks=all
+OR -> CDB : отметка «опубликовано»
+
+K ->> BS : campaign-changes
+BS -> BS : version > текущей?\nда → обновить индекс\nнет → игнорировать (дубль)
+
+note over ADV, BS
+  Изменение применяется в аукционе за 1–5 с.
+  Outbox гарантирует: событие публикуется тогда и только тогда,
+  когда изменение сохранено в БД. Синхронных вызовов
+  Campaign Service на каждый bid-request нет.
+end note
+@enduml

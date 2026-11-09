@@ -1,0 +1,51 @@
+@startuml sequence-win-billing
+title Выигрыш, показ и списание: идемпотентность финансовых операций
+skinparam responseMessageBelowArrow true
+
+participant "DSP-партнёр" as DSP
+participant "Event Collector" as EC
+database "Redis\n(дедупликация)" as Dedup
+queue "Kafka" as K
+participant "Stats Stream\nProcessor" as SP
+participant "Budget & Pacing" as BP
+participant "Billing Service" as BIL
+database "Billing DB\n(ledger)" as DB
+
+DSP -> EC : GET /rtb/bill?bid_id=…&price=…&ts=…&sig=…
+EC -> EC : проверка HMAC-подписи\n(подделка → 403)
+EC -> Dedup : SET NX bill:{bid_id} EX 86400
+alt первое уведомление
+  Dedup --> EC : OK
+  EC -> K : impressions / wins\n{event_id = bid_id, campaign_id, price_micros}\nacks=all, идемпотентный продюсер
+  K --> EC : ack
+  EC --> DSP : 200 OK
+else повтор от партнёра
+  Dedup --> EC : уже есть
+  EC --> DSP : 200 OK (событие не создаётся)
+end
+
+K ->> SP : события (at-least-once)
+SP -> SP : дедупликация по event_id (окно 24 ч)\nагрегация по campaign_id за окно 10 с
+SP ->> K : spend {spend_id = campaign_id + окно,\namount_micros}
+SP -> SP : фиксация смещения после записи
+
+K ->> BP : spend
+BP -> BP : счётчик расхода, pacing;\nостаток < порога → budget-status
+BP ->> K : budget-status (throttled / exhausted)
+
+K ->> BIL : spend
+BIL -> DB : BEGIN\nINSERT ledger(source_id = spend_id, …)\nUPDATE balance\nCOMMIT
+alt spend_id новый
+  DB --> BIL : OK — списание выполнено
+else повтор (unique violation по source_id)
+  DB --> BIL : конфликт
+  BIL -> BIL : считаем успешным,\nсписание не повторяется
+end
+BIL -> BIL : фиксация смещения
+
+note over SP, BIL
+  Ошибки обработки: повторы 200 мс × 2ⁿ (до 30 с, jitter),
+  после 5 неудач — DLQ-топик и алерт.
+  Ежедневная сверка ledger с агрегатами в ClickHouse.
+end note
+@enduml

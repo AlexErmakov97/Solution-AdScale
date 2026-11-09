@@ -1,0 +1,65 @@
+@startuml sequence-bid-degraded
+title Деградация: размыкатели и резервные стратегии
+skinparam responseMessageBelowArrow true
+
+participant "DSP-партнёр" as DSP
+participant "Envoy" as Envoy
+participant "Bid Gateway" as BGW
+participant "Bidding Service" as BS
+database "Redis" as Redis
+participant "Delivery Service" as DEL
+
+== A. Превышена квота партнёра или система перегружена ==
+DSP -> Envoy : bid-request
+Envoy -> Envoy : token bucket пуст /\nadaptive concurrency
+Envoy --> DSP : 204 No Content (no-bid, без штрафа)
+
+== B. Redis медленный: размыкатель открыт ==
+DSP -> Envoy : bid-request
+Envoy -> BGW : bid-request
+BGW -> BS : Bid(), deadline 66 мс
+BS -> BS : CB(Redis) = OPEN → вызов не делается
+BS -> BS : таргетинг только по контексту\n(площадка, гео по IP, устройство);\nстатус бюджета — из памяти;\nцена = default_bid кампании
+BS -> DEL : Render(победитель)
+DEL --> BS : adm
+BS --> BGW : BidResponse(fallback: cached_profile, default_price)
+BGW --> Envoy : 200 OK
+Envoy --> DSP : bid-response (в срок)
+
+== C. Delivery Service недоступен ==
+DSP -> Envoy : bid-request
+Envoy -> BGW : bid-request
+BGW -> BS : Bid()
+BS -> Redis : pipeline
+Redis --> BS : данные
+BS -> BS : CB(Delivery) = OPEN
+BS --> BGW : BidResponse без adm, с nurl\n(fallback: markup_on_win)
+BGW --> Envoy : 200 OK
+Envoy --> DSP : bid-response; разметка будет\nвыдана при вызове nurl
+
+== D. Bidding Service деградирует: размыкатель в Bid Gateway ==
+DSP -> Envoy : bid-request
+Envoy -> BGW : bid-request
+BGW -> BGW : CB(Bidding) = OPEN\n(≥ 20% ошибок / опозданий за 10 с)
+alt кешированные ставки включены для партнёра
+  BGW -> BGW : последняя ставка для\n(размер, площадка, гео), TTL 60 с,\nкампания активна по budget-status
+  BGW --> Envoy : 200 OK + кешированная ставка
+else по умолчанию
+  BGW --> Envoy : 204 No Content
+end
+Envoy --> DSP : ответ сразу, без ожидания таймаута
+
+== E. Дедлайн истекает во время обработки ==
+DSP -> Envoy : bid-request
+Envoy -> BGW : bid-request
+BGW -> BS : Bid(), deadline 66 мс
+BS -> BS : Deadline Guard: осталось < 5 мс
+BS --> BGW : no_bid_reason = DEADLINE_EXCEEDED
+BGW --> Envoy : 204 No Content
+Envoy --> DSP : 204 до истечения tmax
+
+note over DSP, DEL
+  Повторов в hot path нет: в бюджет 80 мс повтор не помещается.
+  Опоздание штрафуется сильнее, чем отказ от ставки.
+end note
+@enduml

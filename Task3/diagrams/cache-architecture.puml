@@ -1,0 +1,56 @@
+@startuml cache-architecture
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+AddElementTag("l1", $bgColor="#7d3c98", $borderColor="#512e5f", $legendText="L1 — память процесса")
+AddElementTag("l2", $bgColor="#b03a2e", $borderColor="#78281f", $legendText="L2 — Redis")
+AddElementTag("src", $bgColor="#1f618d", $borderColor="#154360", $legendText="источник истины")
+AddRelTag("push", $lineStyle=DashedLine(), $legendText="push: обновление событиями")
+
+LAYOUT_TOP_DOWN()
+
+title Кеширование: уровни, источники, инвалидация
+
+Boundary(region, "Регион hot path (в каждом регионе)") {
+  Container(bgw, "Bid Gateway", "Go", "L1: кешированные ставки для резервного ответа, TTL 60 с", $tags="l1")
+  Container(bidding, "Сервис ставок", "C++", "L1: индекс кампаний, ставки, таргетинг, креативы, последний статус бюджета; без TTL, контроль отставания ≤ 30 с", $tags="l1")
+  Container(delivery, "Delivery Service", "Node.js", "L1: шаблоны разметки", $tags="l1")
+  Container(collector, "Event Collector", "Go", "")
+  ContainerDb(redisRtb, "redis-rtb", "Redis Cluster 3×2, LRU", "user:{uid} 30 дн · freq:{uid}:cid 24 ч · budget:status 24 ч · pacing 10 мин", $tags="l2")
+  ContainerDb(redisDedup, "redis-dedup", "Redis, noeviction, AOF", "win/bill:{bid_id} 24 ч", $tags="l2")
+}
+
+Boundary(main, "Основной регион back-office") {
+  Container(campaign, "Сервис кампаний", "Go", "", $tags="src")
+  ContainerDb(campDb, "Campaign DB", "PostgreSQL", "Источник истины о кампаниях", $tags="src")
+  Container(budget, "Budget & Pacing", "Go", "Владелец оперативного статуса бюджета", $tags="src")
+  Container(stats, "Stats Processor", "Kafka Streams", "Обновляет профили и частоты")
+  Container(reporting, "Сервис аналитики", "Python", "")
+  ContainerDb(redisApp, "redis-app", "Redis", "Отчёты: 60 с (сегодня) / 1 ч (закрытые периоды), cache-aside", $tags="l2")
+}
+
+ContainerQueue(kafka, "Kafka", "", "campaign-changes, budget-status")
+System_Ext(cdn, "CDN", "Изображения и скрипты баннеров")
+
+Rel(bgw, bidding, "Bid()", "gRPC")
+Rel(bidding, redisRtb, "Pipeline: профиль, частоты, бюджет", "< 1 мс")
+Rel(bidding, delivery, "Разметка", "gRPC")
+Rel(collector, redisDedup, "SET NX", "RESP")
+
+Rel(campaign, campDb, "Запись + outbox", "SQL")
+Rel(campaign, kafka, "campaign-changes (version)", "", $tags="push")
+Rel(kafka, bidding, "campaign-changes, budget-status → обновление L1", "", $tags="push")
+Rel(budget, redisRtb, "write-through: статус, pacing", "RESP")
+Rel(budget, kafka, "budget-status", "", $tags="push")
+Rel(stats, redisRtb, "Профили, INCR частот", "RESP")
+Rel(reporting, redisApp, "cache-aside", "RESP")
+Rel(bidding, campaign, "Прогрев: снимок при старте", "gRPC stream")
+Rel(delivery, cdn, "Ссылки на креативы в разметке", "HTTPS")
+
+note right of bidding
+  **Прогрев пода:** снимок → догон Kafka
+  → readiness = true → трафик.
+  Сверка версий раз в 10 мин.
+end note
+
+SHOW_LEGEND()
+@enduml
