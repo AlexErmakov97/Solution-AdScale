@@ -1,0 +1,72 @@
+@startuml data-ownership
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+AddElementTag("pg", $bgColor="#1f618d", $borderColor="#154360", $legendText="PostgreSQL (OLTP, источник истины)")
+AddElementTag("ch", $bgColor="#b9770e", $borderColor="#7e5109", $legendText="ClickHouse (OLAP)")
+AddElementTag("mem", $bgColor="#7d3c98", $borderColor="#512e5f", $legendText="Redis / память (производные данные)")
+AddElementTag("svc", $bgColor="#5d6d7e", $borderColor="#34495e", $legendText="сервис")
+AddRelTag("async", $lineStyle=DashedLine(), $legendText="через Kafka")
+
+LAYOUT_TOP_DOWN()
+
+title Database per Service — кто владеет какими данными
+
+ContainerQueue(kafka, "Kafka", "Apache Kafka", "bids, wins, impressions, clicks, spend, budget-status, campaign-changes")
+
+Boundary(bidB, "Сервис ставок") {
+  Container(bidding, "Bidding Service", "C++", "Только читает; своей БД нет", $tags="svc")
+  ContainerDb(bidIndex, "Индекс кампаний", "память процесса", "Кампании, ставки, таргетинг, креативы", $tags="mem")
+  ContainerDb(redisRtb, "redis-rtb", "Redis Cluster", "Профили, частоты, статус бюджета, pacing", $tags="mem")
+}
+
+Boundary(campB, "Сервис кампаний") {
+  Container(campaign, "Campaign Service", "Go", "Кампании, ставки, креативы", $tags="svc")
+  ContainerDb(campDb, "Campaign DB", "PostgreSQL", "Источник истины о кампаниях + outbox", $tags="pg")
+}
+
+Boundary(statB, "Сервис статистики") {
+  Container(stats, "Stats Stream Processor", "Kafka Streams", "Дедупликация, агрегаты, расход", $tags="svc")
+  ContainerDb(statsDb, "stats (ClickHouse)", "ClickHouse", "Сырые события, агрегаты по кампаниям", $tags="ch")
+}
+
+Boundary(repB, "Сервис аналитики") {
+  Container(reporting, "Reporting Service", "Python", "Отчёты рекламодателей", $tags="svc")
+  ContainerDb(repDb, "reporting (ClickHouse)", "ClickHouse", "Собственные витрины (read models)", $tags="ch")
+}
+
+Boundary(finB, "Сервис финансов") {
+  Container(billing, "Billing Service", "Go", "Списания, балансы, счета", $tags="svc")
+  ContainerDb(finDb, "Billing DB", "PostgreSQL", "Ledger, балансы, счета", $tags="pg")
+}
+
+Boundary(budB, "Budget & Pacing") {
+  Container(budget, "Budget & Pacing", "Go", "Оперативный расход и pacing", $tags="svc")
+}
+
+Rel(bidding, bidIndex, "Чтение", "в памяти")
+Rel(bidding, redisRtb, "Чтение", "RESP")
+Rel(campaign, campDb, "Чтение и запись", "SQL")
+Rel(stats, statsDb, "Пакетная вставка", "HTTP / native")
+Rel(reporting, repDb, "Запросы", "SQL")
+Rel(billing, finDb, "Транзакции", "SQL")
+Rel(budget, redisRtb, "Статус бюджета, pacing", "RESP")
+
+Rel(campaign, kafka, "campaign-changes (outbox)", "Kafka", $tags="async")
+Rel(kafka, bidding, "campaign-changes, budget-status", "Kafka", $tags="async")
+Rel(bidding, kafka, "bids", "Kafka", $tags="async")
+Rel(kafka, stats, "bids, wins, impressions, clicks", "Kafka", $tags="async")
+Rel(stats, kafka, "spend", "Kafka", $tags="async")
+Rel(kafka, reporting, "wins, impressions, clicks, spend", "Kafka", $tags="async")
+Rel(kafka, budget, "spend", "Kafka", $tags="async")
+Rel(budget, kafka, "budget-status", "Kafka", $tags="async")
+Rel(kafka, billing, "spend", "Kafka", $tags="async")
+
+note bottom of kafka
+  Сервисы не обращаются к чужим БД:
+  только через API или события Kafka.
+  stats и reporting — разные базы
+  в одном кластере ClickHouse с квотами ресурсов.
+end note
+
+SHOW_LEGEND()
+@enduml
